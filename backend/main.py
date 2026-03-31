@@ -39,114 +39,169 @@ async def analyze_resume(file: UploadFile = File(...)):
         
         content = await file.read()
         resume_text = await parser.parse(content)
-        
-        if not resume_text or len(resume_text.strip()) < 10:
-            return {"error": "Could not extract text from PDF. Please ensure the PDF contains readable text."}
-        
-        # Step 1: Validate if the document is actually a resume
+
+        if not resume_text or len(resume_text.strip()) < 50:
+            return {"error": "Resume text extraction failed or too short"}
+
+        # -------------------------------
+        # STEP 1: Validate Resume
+        # -------------------------------
         validation_prompt = f"""
-        Analyze the following document content and determine if it is a RESUME/CV or not.
-        
-        Document content:
-        {resume_text[:2000]}  # First 2000 chars for quick validation
-        
-        A resume/CV typically contains:
-        - Personal information (name, contact details)
-        - Work experience or employment history
-        - Education background
-        - Skills or competencies
-        - Sometimes: projects, certifications, achievements
-        
-        Respond with ONLY one of these two words:
-        - "RESUME" if this appears to be a resume or CV
-        - "NOT_RESUME" if this is some other type of document (research paper, article, report, random text, etc.)
+        Is this a resume? Answer ONLY: RESUME or NOT_RESUME
+
+        {resume_text[:1500]}
         """
-        
-        validation_response = model.generate_content(validation_prompt)
-        validation_result = validation_response.text.strip().upper()
-        
-        if "NOT_RESUME" in validation_result or "RESUME" not in validation_result:
-            return {
-                "error": "The uploaded file does not appear to be a resume. Please upload a valid resume/CV in PDF format.",
-                "validation_failed": True
-            }
-        
-        # Analyze with Gemini - Enhanced for Skill Gap Analysis and Topic Coverage
-        prompt = f"""
-        You are an expert technical interviewer and career coach. Analyze the following resume:
-        {resume_text}
-        
-        Provide a comprehensive analysis in the following JSON format:
+        validation = model.generate_content(validation_prompt).text.strip().upper()
+
+        if "RESUME" not in validation:
+            return {"error": "Invalid resume uploaded"}
+
+        # -------------------------------
+        # STEP 2: Extract Role (SAFE)
+        # -------------------------------
+        role_prompt = f"""
+        Extract the most suitable job role from this resume.
+
+        Rules:
+        - Only output role name
+        - Max 5 words
+        - No explanation
+
+        Resume:
+        {resume_text[:2000]}
+        """
+
+        role = model.generate_content(role_prompt).text.strip()
+
+        if len(role) > 40 or len(role) < 2:
+            role = "Software Engineer"   # fallback
+
+        # -------------------------------
+        # STEP 3: Generate Job Description
+        # -------------------------------
+        jd_prompt = f"""
+        Create a realistic job description for a {role}.
+
+        Include:
+        - Responsibilities
+        - Required skills
+        - Experience level
+
+        Keep it generic but industry-relevant.
+        """
+
+        jd = model.generate_content(jd_prompt).text.strip()
+
+        # -------------------------------
+        # STEP 4: ATS EVALUATION (CRITICAL)
+        # -------------------------------
+        ats_prompt = f"""
+        You are an ATS system.
+
+        Evaluate this resume strictly.
+
+        Return ONLY JSON:
+
         {{
-            "key_skills": ["skill1", "skill2", ...],
-            "experience_level": "Junior/Mid/Senior/Lead",
-            "skill_gaps": {{
-                "missing_technologies": ["tech1", "tech2"],
-                "weak_areas": ["area1", "area2"],
-                "recommendations": ["recommendation1", "recommendation2"]
-            }},
-            "interview_topics": [
-                {{"topic": "Topic name based on resume", "priority": "high/medium/low", "category": "technical/behavioral/project"}},
-                {{"topic": "Another topic", "priority": "medium", "category": "technical"}}
-            ],
-            "interview_focus_areas": ["area1", "area2", "area3"],
-            "strengths": ["strength1", "strength2"],
-            "career_trajectory": "brief assessment of career growth potential"
+          "ats_score": number,
+          "quality_score": number,
+          "is_good": true/false,
+          "issues": [],
+          "missing_sections": [],
+          "improvements": []
         }}
-        
-        IMPORTANT for interview_topics:
-        - Extract 5-8 specific topics from the resume that should be covered in an interview
-        - Topics should include: key technical skills, major projects, work experiences, soft skills
-        - Assign priority: high (core skills/recent experience), medium (supporting skills), low (nice to explore)
-        - Ensure topics cover the breadth of the candidate's background
-        
-        Be specific about skill gaps - identify what modern technologies or practices might be missing.
-        Return ONLY valid JSON, no markdown or extra text.
-        """
-        
-        response = model.generate_content(prompt)
-        analysis = response.text
-        
-        # Try to extract skill gaps specifically for later use
-        skill_gaps_prompt = f"""
-        Based on this resume, list the TOP 5 skill gaps that should be addressed:
+
+        Resume:
         {resume_text}
-        
-        Return as a simple numbered list. Be specific and actionable.
+
+        Job Description:
+        {jd}
         """
-        skill_gaps_response = model.generate_content(skill_gaps_prompt)
-        skill_gaps = skill_gaps_response.text
-        
-        # Parse interview topics from analysis
-        interview_topics = []
+
+        ats_raw = model.generate_content(ats_prompt).text
+
         try:
-            # Try to extract topics from the analysis JSON
-            analysis_json = json.loads(analysis)
-            if "interview_topics" in analysis_json:
-                interview_topics = analysis_json["interview_topics"]
-        except (json.JSONDecodeError, KeyError):
-            # Fallback: create topics from key_skills if parsing fails
-            pass
-        
-        # Create a session ID
+            ats_data = json.loads(ats_raw)
+        except:
+            return {"error": "ATS parsing failed"}
+
+        # -------------------------------
+        # STEP 5: REJECTION FILTER
+        # -------------------------------
+        if (
+            ats_data.get("ats_score", 0) < 60 or
+            ats_data.get("quality_score", 0) < 50 or
+            not ats_data.get("is_good", False)
+        ):
+            return {
+                "rejected": True,
+                "message": "Resume not suitable for interview",
+                "ats_feedback": ats_data
+            }
+
+        # -------------------------------
+        # STEP 6: ANALYSIS FOR INTERVIEW
+        # -------------------------------
+        analysis_prompt = f"""
+        Analyze resume for interview preparation.
+
+        Return ONLY JSON:
+
+        {{
+          "key_skills": [],
+          "experience_level": "",
+          "interview_topics": [],
+          "strengths": [],
+          "weak_areas": []
+        }}
+
+        Resume:
+        {resume_text}
+
+        Job Description:
+        {jd}
+        """
+
+        analysis_raw = model.generate_content(analysis_prompt).text
+
+        try:
+            analysis = json.loads(analysis_raw)
+        except:
+            analysis = {}
+
+        interview_topics = analysis.get("interview_topics", [])
+
+        # Filter topics
+        interview_topics = [
+            t for t in interview_topics if isinstance(t, dict)
+        ][:6]
+
+        # -------------------------------
+        # SESSION
+        # -------------------------------
         session_id = f"session_{os.urandom(4).hex()}"
+
         sessions[session_id] = {
             "resume_text": resume_text,
+            "job_description": jd,
+            "role": role,
+            "ats_data": ats_data,
             "analysis": analysis,
-            "skill_gaps": skill_gaps,
             "interview_topics": interview_topics,
-            "topics_covered": [],  # Track which topics have been covered
-            "conversation_history": [],
+            "conversation": [],
             "chat": None
         }
-        
-        return {"session_id": session_id, "analysis": analysis}
-    except Exception as e:
-        import traceback
-        print(f"Error in analyze-resume: {e}")
-        traceback.print_exc()
-        return {"error": str(e)}
 
+        return {
+            "session_id": session_id,
+            "role": role,
+            "ats_score": ats_data["ats_score"],
+            "message": "Resume accepted"
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+        
 @app.websocket("/ws/interview/{session_id}")
 async def interview_endpoint(websocket: WebSocket, session_id: str):
     await manager.connect(websocket)
