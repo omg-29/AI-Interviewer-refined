@@ -276,7 +276,7 @@ async def interview_endpoint(websocket: WebSocket, session_id: str):
     TOPIC COVERAGE STRATEGY:
     1. Start with HIGH priority topics first
     2. Naturally transition between topics - don't abruptly switch
-    3. Ask 1-2 questions per topic before moving on
+    3. Ask at least 1-2 questions or more per topic before moving on
     4. If the candidate demonstrates strong knowledge, briefly acknowledge and move to next topic
     5. If they struggle, probe a bit deeper but don't get stuck - move on after 2-3 attempts
     6. Ensure you cover at least the HIGH and MEDIUM priority topics
@@ -486,6 +486,9 @@ async def end_interview(session_id: str):
     
     ### Overall Score: [X.X]/10
     (Justify based on SPECIFIC responses from the transcript)
+
+    ### Resume ATS Score: {session_data['ats_data']['ats_score']}
+    Resume Quality Score: {session_data['ats_data']['quality_score']}
     
     ### Topics Actually Covered
     List ONLY the topics that were discussed with brief assessment:
@@ -506,11 +509,15 @@ async def end_interview(session_id: str):
     
     ### Key Quotes from Interview
     Include 2-3 notable quotes (good or bad) from the candidate's actual responses.
+
+    ### Strengths observed: (Strictly based on the Transcript and overall performance of the candidate)
     
     ### Recommendations for Improvement
     (Base these ONLY on weaknesses actually observed in the interview)
     1. [Specific recommendation based on actual gap shown]
     2. [Specific recommendation based on actual gap shown]
+    3.  Resume Improvements:
+    {session_data['ats_data']['improvements']}
     
     ### Topics NOT Covered (From Resume)
     Compare the "Topics from Resume" list above with what was actually discussed.
@@ -518,7 +525,7 @@ async def end_interview(session_id: str):
     - [Topic from resume]: Not Assessed
     (This helps identify gaps in the interview coverage - do NOT score these)
     
-    Format as clean markdown. Be HONEST and BASE EVERYTHING on the actual transcript above.
+    Format as clean markdown. Be HONEST and BASE EVERYTHING on the actual transcript above and SCORE according to performance, not to make user Happy even if the interview went bad.
     """
     
     response = chat.send_message(prompt)
