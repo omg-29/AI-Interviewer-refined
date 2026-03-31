@@ -1,6 +1,7 @@
 import os
 import uvicorn
 import json
+import asyncio
 from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
@@ -9,14 +10,13 @@ from services.parser import parser
 from services.tts import tts_service
 from managers.socket_manager import ConnectionManager
 
-# Initialize Gemini
+# ---------------- CONFIG ----------------
 genai.configure(api_key=GEMINI_API_KEY)
-# Using gemma-3-1b-it - works without quota issues
 model = genai.GenerativeModel('gemma-3-1b-it')
 
 app = FastAPI()
+manager = ConnectionManager()
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,169 +25,102 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-manager = ConnectionManager()
-
-# Store session data in memory for MVP (use Redis/Supabase in prod)
-# sessionId -> { resume_text: str, chat_session: ChatSession }
 sessions = {}
 
+# ---------------- UTIL ----------------
+def safe_json_parse(text):
+    try:
+        return json.loads(text)
+    except:
+        return None
+
+async def ai_call(prompt, retries=2):
+    for _ in range(retries):
+        try:
+            response = model.generate_content(prompt)
+            return response.text
+        except:
+            await asyncio.sleep(1)
+    return None
+
+# ---------------- RESUME ANALYSIS ----------------
 @app.post("/analyze-resume")
 async def analyze_resume(file: UploadFile = File(...)):
     try:
-        if not file.filename.endswith('.pdf'):
-            return {"error": "Only PDF files are supported"}
-        
+        if not file.filename.endswith(".pdf"):
+            return {"error": "Only PDF supported"}
+
         content = await file.read()
         resume_text = await parser.parse(content)
 
         if not resume_text or len(resume_text.strip()) < 50:
-            return {"error": "Resume text extraction failed or too short"}
+            return {"error": "Invalid or empty resume"}
 
-        # -------------------------------
-        # STEP 1: Validate Resume
-        # -------------------------------
-        validation_prompt = f"""
-        Is this a resume? Answer ONLY: RESUME or NOT_RESUME
+        # ---------- SINGLE UNIFIED PROMPT ----------
+        prompt = f"""
+You are a STRICT ATS + Interview Analyzer.
 
-        {resume_text[:1500]}
-        """
-        validation = model.generate_content(validation_prompt).text.strip().upper()
+Return ONLY JSON:
 
-        if "RESUME" not in validation:
-            return {"error": "Invalid resume uploaded"}
+{{
+  "role": "",
+  "ats_score": 0,
+  "quality_score": 0,
+  "is_good": true,
+  "interview_topics": [],
+  "key_skills": [],
+  "weak_areas": [],
+  "improvements": []
+}}
 
-        # -------------------------------
-        # STEP 2: Extract Role (SAFE)
-        # -------------------------------
-        role_prompt = f"""
-        Extract the most suitable job role from this resume.
+RULES:
+- Be strict (real hiring standards)
+- If resume is bad → is_good = false
+- No hallucination
+- Max 6 interview topics
 
-        Rules:
-        - Only output role name
-        - Max 5 words
-        - No explanation
+Resume:
+{resume_text[:4000]}
+"""
 
-        Resume:
-        {resume_text[:2000]}
-        """
+        raw = await ai_call(prompt)
+        data = safe_json_parse(raw)
 
-        role = model.generate_content(role_prompt).text.strip()
+        if not data:
+            return {"error": "AI parsing failed"}
 
+        # ---------- FALLBACKS ----------
+        role = data.get("role", "Software Engineer")
         if len(role) > 40 or len(role) < 2:
-            role = "Software Engineer"   # fallback
+            role = "Software Engineer"
 
-        # -------------------------------
-        # STEP 3: Generate Job Description
-        # -------------------------------
-        jd_prompt = f"""
-        Create a realistic job description for a {role}.
+        ats_score = data.get("ats_score", 0)
+        quality_score = data.get("quality_score", 0)
+        is_good = data.get("is_good", False)
 
-        Include:
-        - Responsibilities
-        - Required skills
-        - Experience level
-
-        Keep it generic but industry-relevant.
-        """
-
-        jd = model.generate_content(jd_prompt).text.strip()
-
-        # -------------------------------
-        # STEP 4: ATS EVALUATION (CRITICAL)
-        # -------------------------------
-        ats_prompt = f"""
-        You are an ATS system.
-
-        Evaluate this resume strictly.
-
-        Return ONLY JSON:
-
-        {{
-          "ats_score": number,
-          "quality_score": number,
-          "is_good": true/false,
-          "issues": [],
-          "missing_sections": [],
-          "improvements": []
-        }}
-
-        Resume:
-        {resume_text}
-
-        Job Description:
-        {jd}
-        """
-
-        ats_raw = model.generate_content(ats_prompt).text
-
-        try:
-            ats_data = json.loads(ats_raw)
-        except:
-            return {"error": "ATS parsing failed"}
-
-        # -------------------------------
-        # STEP 5: REJECTION FILTER
-        # -------------------------------
-        if (
-            ats_data.get("ats_score", 0) < 60 or
-            ats_data.get("quality_score", 0) < 50 or
-            not ats_data.get("is_good", False)
-        ):
+        # ---------- REJECTION ----------
+        if ats_score < 60 or quality_score < 50 or not is_good:
             return {
                 "rejected": True,
-                "message": "Resume not suitable for interview",
-                "ats_feedback": ats_data
+                "message": "Resume not shortlisted",
+                "feedback": data
             }
 
-        # -------------------------------
-        # STEP 6: ANALYSIS FOR INTERVIEW
-        # -------------------------------
-        analysis_prompt = f"""
-        Analyze resume for interview preparation.
+        # ---------- GENERATE JD ----------
+        jd_prompt = f"""
+Generate a concise job description for a {role}.
+Include skills and responsibilities.
+"""
+        jd = await ai_call(jd_prompt) or ""
 
-        Return ONLY JSON:
-
-        {{
-          "key_skills": [],
-          "experience_level": "",
-          "interview_topics": [],
-          "strengths": [],
-          "weak_areas": []
-        }}
-
-        Resume:
-        {resume_text}
-
-        Job Description:
-        {jd}
-        """
-
-        analysis_raw = model.generate_content(analysis_prompt).text
-
-        try:
-            analysis = json.loads(analysis_raw)
-        except:
-            analysis = {}
-
-        interview_topics = analysis.get("interview_topics", [])
-
-        # Filter topics
-        interview_topics = [
-            t for t in interview_topics if isinstance(t, dict)
-        ][:6]
-
-        # -------------------------------
-        # SESSION
-        # -------------------------------
+        # ---------- SESSION ----------
         session_id = f"session_{os.urandom(4).hex()}"
-
         sessions[session_id] = {
             "resume_text": resume_text,
-            "job_description": jd,
             "role": role,
-            "ats_data": ats_data,
-            "analysis": analysis,
-            "interview_topics": interview_topics,
+            "job_description": jd,
+            "ats_data": data,
+            "interview_topics": data.get("interview_topics", []),
             "conversation": [],
             "chat": None
         }
@@ -195,96 +128,23 @@ async def analyze_resume(file: UploadFile = File(...)):
         return {
             "session_id": session_id,
             "role": role,
-            "ats_score": ats_data["ats_score"],
-            "message": "Resume accepted"
+            "ats_score": ats_score,
+            "message": "Accepted"
         }
 
     except Exception as e:
         return {"error": str(e)}
-        
+
+# ---------------- INTERVIEW ----------------
 @app.websocket("/ws/interview/{session_id}")
-async def interview_endpoint(websocket: WebSocket, session_id: str):
+async def interview(websocket: WebSocket, session_id: str):
     await manager.connect(websocket)
-    
-    session_data = sessions.get(session_id)
-    if not session_data:
-        await websocket.close(code=4004, reason="Session not found")
+    session = sessions.get(session_id)
+
+    if not session:
+        await websocket.close()
         return
 
-    # Get interview settings from query params
-    query_params = dict(websocket.query_params)
-    persona = query_params.get("persona", "balanced")
-    interview_type = query_params.get("type", "mixed")
-    difficulty = query_params.get("difficulty", "mid")
-    duration = int(query_params.get("duration", "15"))  # Duration in minutes
-    
-    # Store duration in session for report generation
-    session_data["duration"] = duration
-    session_data["code_submissions"] = []  # Track code submissions
-    
-    # Get interview topics and calculate time per topic
-    interview_topics = session_data.get("interview_topics", [])
-    num_topics = len(interview_topics) if interview_topics else 5
-    minutes_per_topic = max(2, duration // num_topics)  # At least 2 minutes per topic
-    
-    # Persona-specific behaviors
-    persona_traits = {
-        "friendly": {
-            "name": "Shreya",
-            "style": "warm, supportive, and encouraging. Give positive feedback frequently. Help candidates when they struggle.",
-            "greeting": "Hi there! I'm Shreya. Thanks so much for joining me today! I've had a chance to look at your resume - really impressive stuff! How are you feeling today?"
-        },
-        "balanced": {
-            "name": "Shreya", 
-            "style": "professional, fair, and constructive. Give balanced feedback. Ask follow-up questions to probe deeper.",
-            "greeting": "Hello! I'm Shreya. Thanks for joining me today. I've reviewed your resume, and it looks good. How are you doing today?"
-        },
-        "strict": {
-            "name": "Shreya",
-            "style": "rigorous, challenging, and demanding. Push candidates to think harder. Ask tough follow-up questions. Don't accept vague answers.",
-            "greeting": "Good day. I'm Shreya, and I'll be conducting your technical interview. I've reviewed your resume. Let's get started - we have limited time."
-        }
-    }
-    
-    traits = persona_traits.get(persona, persona_traits["balanced"])
-    
-    # Coding question instructions for longer interviews (>=10 minutes)
-    coding_instructions = ""
-    if duration >= 10 and interview_type in ["technical", "mixed"]:
-        coding_instructions = f"""
-    
-    CODING QUESTION REQUIREMENT:
-    Since this is a {duration}-minute interview, you MUST ask at least ONE coding problem.
-    - Ask a coding question appropriate for {difficulty} level (e.g., array manipulation, string processing, algorithm design)
-    - Clearly state the problem, input format, and expected output
-    - Tell the candidate to use the code editor on the right side of the screen to write their solution
-    - Tell them to click 'Submit Code' when they are done
-    - After they submit, you will receive their code and should provide feedback on it
-    - Evaluate: correctness, code quality, efficiency, and edge case handling
-    """
-    
-    # Build topics coverage instruction
-    topics_instruction = ""
-    if interview_topics:
-        topics_list = "\n".join([f"    - [{t.get('priority', 'medium').upper()}] {t.get('topic', 'Unknown')} ({t.get('category', 'general')})" for t in interview_topics])
-        topics_instruction = f"""
-    
-    TOPICS TO COVER (from candidate's resume):
-    You have {duration} minutes total. Aim to spend ~{minutes_per_topic} minutes per topic.
-{topics_list}
-    
-    TOPIC COVERAGE STRATEGY:
-    1. Start with HIGH priority topics first
-    2. Naturally transition between topics - don't abruptly switch
-    3. Ask at least 1-2 questions or more per topic before moving on
-    4. If the candidate demonstrates strong knowledge, briefly acknowledge and move to next topic
-    5. If they struggle, probe a bit deeper but don't get stuck - move on after 2-3 attempts
-    6. Ensure you cover at least the HIGH and MEDIUM priority topics
-    7. Keep track mentally of which topics you've covered
-    8. Near the end of the interview, if you haven't covered important topics, ask about them directly
-    """
-    
-    # Initialize Chat Session with Persona
     system_prompt = f"""
 You are a professional interviewer at a MAANG Company.
 
@@ -310,155 +170,51 @@ RULES:
 - If the user asks to end the interview, first ask for confirmation, if they agrees then tell them to click the end interview button and do not start the interview again even if they say to do so. Because once the interview is over, it means it's over.
 
 """
-    
+
     chat = model.start_chat(history=[
         {"role": "user", "parts": [system_prompt]},
-        {"role": "model", "parts": [f"Understood. I am {traits['name']}. I am ready to interview the candidate."]}
+        {"role": "model", "parts": ["Ready"]}
     ])
-    session_data["chat"] = chat
 
-    # Initial greeting from AI
-    greeting = traits["greeting"]
-    # Send text
-    await manager.send_personal_message(json.dumps({"type": "text", "content": greeting}), websocket)
-    # Send audio
-    audio_bytes = await tts_service.generate_audio(greeting)
-    await websocket.send_bytes(audio_bytes) 
+    session["chat"] = chat
+
+    await manager.send_personal_message(
+        json.dumps({"type": "text", "content": "Let's start the interview."}),
+        websocket
+    )
 
     try:
         while True:
-            data = await websocket.receive_text()
-            # client sends JSON: { "type": "transcript", "content": "..." }
-            message_data = json.loads(data)
-            
-            # Handle ping messages to keep connection alive
-            if message_data.get("type") == "ping":
-                await manager.send_personal_message(json.dumps({"type": "pong"}), websocket)
-                continue
-            
-            # Handle code submissions
-            if message_data.get("type") == "code_submission":
-                code = message_data.get("code", "")
-                language = message_data.get("language", "unknown")
-                
-                # Store the code submission
-                session_data["code_submissions"].append({
-                    "code": code,
-                    "language": language
-                })
-                
-                # Send code to AI for evaluation
-                code_prompt = f"""The candidate has submitted their code solution:
+            data = json.loads(await websocket.receive_text())
 
-Language: {language}
-```{language}
-{code}
-```
+            if data.get("type") == "transcript":
+                user_text = data["content"]
 
-Please review this code and provide brief feedback on:
-1. Does it look correct for the problem asked?
-2. Code quality and readability
-3. Any suggestions for improvement
-
-Keep your response concise (2-4 sentences)."""
-                
-                # Store in conversation
-                if "conversation" not in session_data:
-                    session_data["conversation"] = []
-                session_data["conversation"].append(f"User submitted code ({language}):\n{code}")
-                
-                # Get AI response
-                response = chat.send_message(code_prompt)
-                ai_text = response.text
-                
-                # Store AI response
-                session_data["conversation"].append(f"AI: {ai_text}")
-                
-                # Send Text
-                await manager.send_personal_message(json.dumps({"type": "text", "content": ai_text}), websocket)
-                
-                # Generate and Send Audio
-                audio_data = await tts_service.generate_audio(ai_text)
-                await websocket.send_bytes(audio_data)
-                continue
-            
-            if message_data.get("type") == "transcript":
-                user_text = message_data["content"]
-                
-                # Store conversation in session for report generation
-                if "conversation" not in session_data:
-                    session_data["conversation"] = []
-                session_data["conversation"].append(f"User: {user_text}")
-                
-                # Get AI response
+                session["conversation"].append(f"User: {user_text}")
                 response = chat.send_message(user_text)
                 ai_text = response.text
-                
-                # Store AI response
-                session_data["conversation"].append(f"AI: {ai_text}")
-                
-                # Send Text
-                await manager.send_personal_message(json.dumps({"type": "text", "content": ai_text}), websocket)
-                
-                # Generate and Send Audio
-                audio_data = await tts_service.generate_audio(ai_text)
-                await websocket.send_bytes(audio_data)
+                session["conversation"].append(f"AI: {ai_text}")
+
+                await manager.send_personal_message(
+                    json.dumps({"type": "text", "content": ai_text}),
+                    websocket
+                )
 
     except WebSocketDisconnect:
         manager.disconnect(websocket)
-        print(f"Client #{session_id} left")
-    except Exception as e:
-        print(f"Error: {e}")
-        manager.disconnect(websocket)
 
+# ---------------- FINAL REPORT ----------------
 @app.post("/end-interview/{session_id}")
 async def end_interview(session_id: str):
-    session_data = sessions.get(session_id)
-    if not session_data or not session_data.get("chat"):
-        return {"error": "Session not found or chat not initialized"}
-    
-    chat = session_data["chat"]
-    skill_gaps = session_data.get("skill_gaps", "No skill gap data available")
-    code_submissions = session_data.get("code_submissions", [])
-    
-    # Get the actual conversation that happened
-    conversation_history = session_data.get("conversation", [])
-    conversation_text = "\n".join(conversation_history) if conversation_history else "No conversation recorded"
-    
-    # Get interview duration and topics covered
-    duration = session_data.get("duration", 15)
-    interview_topics = session_data.get("interview_topics", [])
-    
-    # Build coding assessment section if code was submitted
-    coding_section = ""
-    if code_submissions:
-        coding_section = """
-    ### Coding Assessment
-    The candidate submitted code during the interview. Evaluate ONLY the submitted code:
-    - Code Correctness: [1-10]/10 (Does the code solve the problem asked?)
-    - Code Quality: [1-10]/10 (Readability, naming, structure)
-    - Efficiency: [1-10]/10 (Time/space complexity considerations)
-    - Edge Cases: [1-10]/10 (Did they handle edge cases?)
-    - Overall Coding Score: [1-10]/10
-    (Provide specific feedback on their actual submitted code)
-    """
-        # Append code submissions to prompt for context
-        for i, submission in enumerate(code_submissions, 1):
-            coding_section += f"\n    Code Submission {i} ({submission['language']}):\n    ```{submission['language']}\n    {submission['code']}\n    ```\n"
-    
-    # Build topics list from resume for comparison
-    topics_from_resume = ""
-    if interview_topics:
-        topics_list = "\n".join([f"    - {t.get('topic', 'Unknown')} ({t.get('priority', 'medium')} priority)" for t in interview_topics])
-        topics_from_resume = f"""
-    ============ TOPICS FROM RESUME (Expected to be covered) ============
-{topics_list}
-    ======================================================================
-    """
-    
-    # Generate Report using Gemini with explicit conversation context
+    session = sessions.get(session_id)
+
+    if not session:
+        return {"error": "Session not found"}
+
+    conversation = "\n".join(session["conversation"])
+
     prompt = f"""
-    The interview is complete. Generate a Report Card based STRICTLY on the actual conversation below.
+The interview is complete. Generate a Report Card based STRICTLY on the actual conversation below.
     
     ============ ACTUAL INTERVIEW TRANSCRIPT ============
     {conversation_text}
@@ -527,11 +283,14 @@ async def end_interview(session_id: str):
     
     Format as clean markdown. Be HONEST and BASE EVERYTHING on the actual transcript above and SCORE according to performance, not to make user Happy even if the interview went bad.
     """
-    
-    response = chat.send_message(prompt)
-    report = response.text
-    
-    return {"report": report, "skill_gaps": skill_gaps}
 
+    report = await ai_call(prompt)
+
+    return {
+        "report": report,
+        "ats_score": session['ats_data']['ats_score']
+    }
+
+# ---------------- RUN ----------------
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
