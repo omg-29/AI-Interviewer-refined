@@ -7,12 +7,11 @@ from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
 from config import GEMINI_API_KEY
 from services.parser import parser
-from services.tts import tts_service
 from managers.socket_manager import ConnectionManager
 
 # ---------------- CONFIG ----------------
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemma-3-1b-it')
+model = genai.GenerativeModel('gemini-2.0-flash')
 
 app = FastAPI()
 manager = ConnectionManager()
@@ -30,6 +29,9 @@ sessions = {}
 # ---------------- UTIL ----------------
 def safe_json_parse(text):
     try:
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
         return json.loads(text)
     except:
         return None
@@ -56,7 +58,6 @@ async def analyze_resume(file: UploadFile = File(...)):
         if not resume_text or len(resume_text.strip()) < 50:
             return {"error": "Invalid or empty resume"}
 
-        # ---------- SINGLE UNIFIED PROMPT ----------
         prompt = f"""
 You are a STRICT ATS + Interview Analyzer.
 
@@ -80,12 +81,14 @@ RULES:
 - Max 6 interview topics
 
 Resume:
-{resume_text[:4000]}
+{resume_text[:3500]}
 """
 
         raw = await ai_call(prompt)
-        data = safe_json_parse(raw)
+        if not raw:
+            return {"error": "AI service unavailable"}
 
+        data = safe_json_parse(raw)
         if not data:
             return {"error": "AI parsing failed"}
 
@@ -114,6 +117,9 @@ Include skills and responsibilities.
         jd = await ai_call(jd_prompt) or ""
 
         # ---------- SESSION ----------
+        if len(sessions) > 100:
+            sessions.pop(next(iter(sessions)))
+
         session_id = f"session_{os.urandom(4).hex()}"
         sessions[session_id] = {
             "resume_text": resume_text,
@@ -145,30 +151,30 @@ async def interview(websocket: WebSocket, session_id: str):
         await websocket.close()
         return
 
+    # FIXED: session_data → session
     system_prompt = f"""
 You are a professional interviewer at a MAANG Company.
 
 Candidate Resume:
-{session_data['resume_text']}
+{session['resume_text']}
 
 Target Role:
-{session_data['role']}
+{session['role']}
 
 Job Description:
-{session_data['job_description']}
+{session['job_description']}
 
 RULES:
-- Start the main interview after asking 1-2 basic questions like "Tell me about yourself?" or "Introduce Yourself." to make a smooth start.
-- Ask ONE question at a time.
-- Ask 1-2 follow ups based on the users response to validate the grasp on the technical topic.
+- Start with 1-2 basic questions like "Tell me about Yourself" or "Introduce Yourself."
+- Ask ONE question at a time
+- Ask follow-ups
 - Base questions ONLY on resume + JD
 - Adjust difficulty dynamically
-- If candidate struggles → simplify
-- If strong → go deeper
-- Keep answers of reasonable length.
-- Never change the question or topic if user tells to do so normally, until and unless the user says that they cannot answer the question or does not know about the topic.
-- If the user asks to end the interview, first ask for confirmation, if they agrees then tell them to click the end interview button and do not start the interview again even if they say to do so. Because once the interview is over, it means it's over.
-
+- Simplify if struggling
+- Go deeper if strong
+- Keep answers reasonable length
+- Do not change topic and question unless user gives up and politely requests to do so, not just to skip.
+- Confirm before ending interview twice, and never continue once terminated by user, even if they say to do so.
 """
 
     chat = model.start_chat(history=[
@@ -185,7 +191,10 @@ RULES:
 
     try:
         while True:
-            data = json.loads(await websocket.receive_text())
+            try:
+                data = json.loads(await websocket.receive_text())
+            except:
+                continue
 
             if data.get("type") == "transcript":
                 user_text = data["content"]
@@ -212,6 +221,12 @@ async def end_interview(session_id: str):
         return {"error": "Session not found"}
 
     conversation = "\n".join(session["conversation"])
+
+    # FIXED missing variables
+    conversation_text = conversation
+    topics_from_resume = ", ".join(session.get("interview_topics", []))
+    duration = len(session["conversation"]) // 2
+    coding_section = ""
 
     prompt = f"""
 The interview is complete. Generate a Report Card based STRICTLY on the actual conversation below.
@@ -243,8 +258,8 @@ The interview is complete. Generate a Report Card based STRICTLY on the actual c
     ### Overall Score: [X.X]/10
     (Justify based on SPECIFIC responses from the transcript)
 
-    ### Resume ATS Score: {session_data['ats_data']['ats_score']}
-    Resume Quality Score: {session_data['ats_data']['quality_score']}
+    ### Resume ATS Score: {session['ats_data']['ats_score']}
+    Resume Quality Score: {session['ats_data']['quality_score']}
     
     ### Topics Actually Covered
     List ONLY the topics that were discussed with brief assessment:
@@ -273,7 +288,7 @@ The interview is complete. Generate a Report Card based STRICTLY on the actual c
     1. [Specific recommendation based on actual gap shown]
     2. [Specific recommendation based on actual gap shown]
     3.  Resume Improvements:
-    {session_data['ats_data']['improvements']}
+    {session['ats_data']['improvements']}
     
     ### Topics NOT Covered (From Resume)
     Compare the "Topics from Resume" list above with what was actually discussed.
