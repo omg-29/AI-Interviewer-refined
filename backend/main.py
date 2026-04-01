@@ -11,7 +11,7 @@ from managers.socket_manager import ConnectionManager
 
 # ---------------- CONFIG ----------------
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-3-flash-preview')
+model = genai.GenerativeModel('gemma-3-1b-it')
 
 app = FastAPI()
 manager = ConnectionManager()
