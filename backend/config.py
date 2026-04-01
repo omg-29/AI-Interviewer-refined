@@ -27,7 +27,7 @@ if not firebase_admin._apps:
 
 # Supabase Configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")
 
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
