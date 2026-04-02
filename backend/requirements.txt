@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 google-generativeai
+openai
 pypdf
 firebase-admin
 supabase
