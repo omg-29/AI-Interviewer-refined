@@ -2,19 +2,18 @@ import os
 import uvicorn
 import json
 import asyncio
+import time
 from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-import google.generativeai as genai
-from config import GEMINI_API_KEY
-from services.parser import parser
-from managers.socket_manager import ConnectionManager
+from collections import defaultdict
 
-# ---------------- CONFIG ----------------
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemma-3-1b-it')
+# ----------- QWEN (OpenAI-compatible) -----------
+from openai import OpenAI
+client = OpenAI(api_key=os.getenv("QWEN_API_KEY"), base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
+MODEL_NAME = "qwen-plus"
 
+# ----------- APP SETUP -----------
 app = FastAPI()
-manager = ConnectionManager()
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,8 +24,10 @@ app.add_middleware(
 )
 
 sessions = {}
+last_call_time = defaultdict(float)
+request_queues = {}
 
-# ---------------- UTIL ----------------
+# ----------- UTIL -----------
 def safe_json_parse(text):
     try:
         text = text.strip()
@@ -36,29 +37,78 @@ def safe_json_parse(text):
     except:
         return None
 
-async def ai_call(prompt, retries=2):
+# ----------- RATE LIMIT -----------
+async def rate_limited(session_id, delay=2):
+    now = time.time()
+    if now - last_call_time[session_id] < delay:
+        return False
+    last_call_time[session_id] = now
+    return True
+
+# ----------- RETRY LOGIC -----------
+async def ai_call(messages, retries=5):
+    delay = 1
     for _ in range(retries):
         try:
-            response = model.generate_content(prompt)
-            return response.text
-        except:
-            await asyncio.sleep(1)
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            if "429" in str(e):
+                await asyncio.sleep(delay)
+                delay *= 2
+            else:
+                await asyncio.sleep(1)
     return None
 
-# ---------------- RESUME ANALYSIS ----------------
+# ----------- QUEUE PROCESSOR -----------
+async def process_queue(session_id, websocket):
+    queue = request_queues[session_id]
+
+    while True:
+        user_text = await queue.get()
+
+        if not await rate_limited(session_id):
+            queue.task_done()
+            continue
+
+        session = sessions[session_id]
+        messages = session["messages"]
+
+        messages.append({"role": "user", "content": user_text})
+
+        response = await ai_call(messages)
+        if not response:
+            queue.task_done()
+            continue
+
+        messages.append({"role": "assistant", "content": response})
+        session["conversation"].append(f"User: {user_text}")
+        session["conversation"].append(f"AI: {response}")
+
+        await websocket.send_text(json.dumps({
+            "type": "text",
+            "content": response
+        }))
+
+        queue.task_done()
+
+# ----------- RESUME ANALYSIS (RESTORED ATS LOGIC) -----------
 @app.post("/analyze-resume")
 async def analyze_resume(file: UploadFile = File(...)):
-    try:
-        if not file.filename.endswith(".pdf"):
-            return {"error": "Only PDF supported"}
+    if not file.filename.endswith(".pdf"):
+        return {"error": "Only PDF supported"}
 
-        content = await file.read()
-        resume_text = await parser.parse(content)
+    content = await file.read()
+    resume_text = await parser.parse(content)
+    resume_text = resume_text[:4000]
 
-        if not resume_text or len(resume_text.strip()) < 50:
-            return {"error": "Invalid or empty resume"}
+    if len(resume_text.strip()) < 50:
+        return {"error": "Invalid or empty resume"}
 
-        prompt = f"""
+    prompt = f"""
 You are a STRICT ATS + Interview Analyzer.
 
 Return ONLY JSON:
@@ -81,160 +131,133 @@ RULES:
 - Max 6 interview topics
 
 Resume:
-{resume_text[:3500]}
+{resume_text}
 """
 
-        raw = await ai_call(prompt)
-        if not raw:
-            return {"error": "AI service unavailable"}
+    raw = await ai_call([
+        {"role": "system", "content": "You are an ATS analyzer."},
+        {"role": "user", "content": prompt}
+    ])
 
-        data = safe_json_parse(raw)
-        if not data:
-            return {"error": "AI parsing failed"}
+    if not raw:
+        return {"error": "AI unavailable"}
 
-        # ---------- FALLBACKS ----------
-        role = data.get("role", "Software Engineer")
-        if len(role) > 40 or len(role) < 2:
-            role = "Software Engineer"
+    data = safe_json_parse(raw)
+    if not data:
+        return {"error": "Parsing failed", "raw": raw}
 
-        ats_score = data.get("ats_score", 0)
-        quality_score = data.get("quality_score", 0)
-        is_good = data.get("is_good", False)
+    role = data.get("role", "Software Engineer")
+    ats_score = data.get("ats_score", 0)
+    quality_score = data.get("quality_score", 0)
+    is_good = data.get("is_good", False)
 
-        # ---------- REJECTION ----------
-        if ats_score < 60 or quality_score < 50 or not is_good:
-            return {
-                "rejected": True,
-                "message": "Resume not shortlisted",
-                "feedback": data
-            }
-
-        # ---------- GENERATE JD ----------
-        jd_prompt = f"""
-Generate a concise job description for a {role}.
-Include skills and responsibilities.
-"""
-        jd = await ai_call(jd_prompt) or ""
-
-        # ---------- SESSION ----------
-        if len(sessions) > 100:
-            sessions.pop(next(iter(sessions)))
-
-        session_id = f"session_{os.urandom(4).hex()}"
-        sessions[session_id] = {
-            "resume_text": resume_text,
-            "role": role,
-            "job_description": jd,
-            "ats_data": data,
-            "interview_topics": data.get("interview_topics", []),
-            "conversation": [],
-            "chat": None
-        }
-
+    if ats_score < 60 or quality_score < 50 or not is_good:
         return {
-            "session_id": session_id,
-            "role": role,
-            "ats_score": ats_score,
-            "message": "Accepted"
+            "rejected": True,
+            "message": "Resume not shortlisted",
+            "feedback": data
         }
 
-    except Exception as e:
-        return {"error": str(e)}
+    jd_prompt = f"Generate a concise job description for a {role}."
 
-# ---------------- INTERVIEW ----------------
-@app.websocket("/ws/interview/{session_id}")
-async def interview(websocket: WebSocket, session_id: str):
-    await manager.connect(websocket)
-    session = sessions.get(session_id)
+    jd = await ai_call([
+        {"role": "system", "content": "You generate job descriptions."},
+        {"role": "user", "content": jd_prompt}
+    ]) or ""
 
-    if not session:
-        await websocket.close()
-        return
+    session_id = f"session_{os.urandom(4).hex()}"
 
-    # FIXED: session_data → session
-    system_prompt = f"""
+    sessions[session_id] = {
+        "messages": [
+            {
+                "role": "system",
+                "content": f"""
 You are a professional interviewer at a MAANG Company.
 
 Candidate Resume:
-{session['resume_text']}
+{resume_text}
 
 Target Role:
-{session['role']}
+{role}
 
 Job Description:
-{session['job_description']}
+{jd}
 
 RULES:
-- Start with 1-2 basic questions like "Tell me about Yourself" or "Introduce Yourself."
 - Ask ONE question at a time
 - Ask follow-ups
 - Base questions ONLY on resume + JD
 - Adjust difficulty dynamically
-- Simplify if struggling
-- Go deeper if strong
-- Keep answers reasonable length
-- Do not change topic and question unless user gives up and politely requests to do so, not just to skip.
-- Confirm before ending interview twice, and never continue once terminated by user, even if they say to do so.
+- Keep answers concise
 """
+            }
+        ],
+        "conversation": [],
+        "ats_data": data,
+        "role": role,
+        "job_description": jd,
+        "interview_topics": data.get("interview_topics", [])
+    }
 
-    chat = model.start_chat(history=[
-        {"role": "user", "parts": [system_prompt]},
-        {"role": "model", "parts": ["Ready"]}
-    ])
+    return {
+        "session_id": session_id,
+        "role": role,
+        "ats_score": ats_score,
+        "message": "Accepted"
+    }
 
-    session["chat"] = chat
+# ----------- WEBSOCKET -----------
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    await websocket.accept()
 
-    await manager.send_personal_message(
-        json.dumps({"type": "text", "content": "Let's start the interview."}),
-        websocket
-    )
+    if session_id not in sessions:
+        await websocket.close()
+        return
+
+    request_queues[session_id] = asyncio.Queue()
+    asyncio.create_task(process_queue(session_id, websocket))
+
+    await websocket.send_text(json.dumps({
+        "type": "text",
+        "content": "Let's start the interview."
+    }))
 
     try:
         while True:
-            try:
-                data = json.loads(await websocket.receive_text())
-            except:
-                continue
+            data = json.loads(await websocket.receive_text())
 
             if data.get("type") == "transcript":
-                user_text = data["content"]
+                text = data.get("content", "").strip()
 
-                session["conversation"].append(f"User: {user_text}")
-                response = chat.send_message(user_text)
-                ai_text = response.text
-                session["conversation"].append(f"AI: {ai_text}")
+                # -------- DEBOUNCE --------
+                if len(text) < 15:
+                    continue
 
-                await manager.send_personal_message(
-                    json.dumps({"type": "text", "content": ai_text}),
-                    websocket
-                )
+                await request_queues[session_id].put(text)
 
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        pass
 
-# ---------------- FINAL REPORT ----------------
-@app.post("/end-interview/{session_id}")
+# ----------- FINAL REPORT (ULTRA DETAILED RESTORED) -----------
+@app.post("/end/{session_id}")
 async def end_interview(session_id: str):
     session = sessions.get(session_id)
-
     if not session:
         return {"error": "Session not found"}
 
-    conversation = "\n".join(session["conversation"])
-
-    # FIXED missing variables
-    conversation_text = conversation
+    conversation = "
+".join(session["conversation"])
     topics_from_resume = ", ".join(session.get("interview_topics", []))
     duration = len(session["conversation"]) // 2
-    coding_section = ""
 
     prompt = f"""
 The interview is complete. Generate a Report Card based STRICTLY on the actual conversation below.
     
     ============ ACTUAL INTERVIEW TRANSCRIPT ============
-    {conversation_text}
+    {conversation}
     =====================================================
-    {topics_from_resume}
+    Topics from Resume: {topics_from_resume}
     Interview Duration: {duration} minutes
     
     ⚠️ CRITICAL INSTRUCTIONS - READ CAREFULLY:
@@ -271,38 +294,44 @@ The interview is complete. Generate a Report Card based STRICTLY on the actual c
     - Demonstrated Proficiency: (Junior/Mid/Senior - based ONLY on actual answers)
     - Strengths Shown: (2-3 specific examples with quotes from transcript)
     - Weaknesses Identified: (2-3 specific gaps shown in actual responses)
-    {coding_section}
     
     ### Communication Quality
-    - Clarity: [1-10]/10 (How clearly did they explain in their actual responses?)
-    - Depth of Answers: [1-10]/10 (Did they provide detailed or superficial answers?)
-    - Technical Vocabulary: [1-10]/10 (Did they use correct terminology?)
+    - Clarity: [1-10]/10
+    - Depth of Answers: [1-10]/10
+    - Technical Vocabulary: [1-10]/10
     
     ### Key Quotes from Interview
     Include 2-3 notable quotes (good or bad) from the candidate's actual responses.
 
-    ### Strengths observed: (Strictly based on the Transcript and overall performance of the candidate)
+    ### Strengths observed
+    (Strictly based on the Transcript and overall performance)
     
     ### Recommendations for Improvement
-    (Base these ONLY on weaknesses actually observed in the interview)
     1. [Specific recommendation based on actual gap shown]
     2. [Specific recommendation based on actual gap shown]
-    3.  Resume Improvements:
+    3. Resume Improvements:
     {session['ats_data']['improvements']}
     
     ### Topics NOT Covered (From Resume)
-    Compare the "Topics from Resume" list above with what was actually discussed.
-    List any resume topics that were NOT discussed during the interview as "Not Assessed":
     - [Topic from resume]: Not Assessed
-    (This helps identify gaps in the interview coverage - do NOT score these)
     
-    Format as clean markdown. Be HONEST and BASE EVERYTHING on the actual transcript above and SCORE according to performance, not to make user Happy even if the interview went bad.
+    Format as clean markdown. Be HONEST and BASE EVERYTHING on the actual transcript above.
     """
 
-    report = await ai_call(prompt)
+    report = await ai_call([
+        {"role": "system", "content": "You are an expert interviewer generating strict evaluation reports."},
+        {"role": "user", "content": prompt}
+    ])
 
     return {
         "report": report,
+        "ats_score": session['ats_data']['ats_score']
+    }
+
+# ----------- RUN -----------
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+       "report": report,
         "ats_score": session['ats_data']['ats_score']
     }
 
