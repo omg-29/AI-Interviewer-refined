@@ -115,7 +115,7 @@ SUPABASE_ANON_KEY=your_supabase_anon_key
 |-------|------------|
 | Frontend | Next.js 14, React, TypeScript, Tailwind CSS |
 | Backend | Python, FastAPI, WebSocket |
-| AI | QWEN 3.5 Plus |
+| AI | QWEN Plus Ai Model |
 | TTS | Edge TTS (Neerja Neural voice - Indian English) |
 | Face Detection | face-api.js with TinyFaceDetector |
 | Code Editor | Monaco Editor |
