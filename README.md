@@ -60,7 +60,7 @@ An AI-powered video interview platform that conducts realistic mock interviews w
 ### Prerequisites
 - Python 3.8+
 - Node.js 18+
-- Gemini API Key (free from Google AI Studio)
+- QWEN Plus API Key
 
 ### Setup
 
@@ -77,7 +77,7 @@ cp .env.example .env
 
 3. **Add your API keys to `.env`**
 ```env
-GEMINI_API_KEY=your_gemini_api_key
+QWEN_API_KEY=your_qwen_plus_api_key
 SUPABASE_URL=your_supabase_project_url
 SUPABASE_ANON_KEY=your_supabase_anon_key
 ```
@@ -99,7 +99,7 @@ SUPABASE_ANON_KEY=your_supabase_anon_key
 | **Root Directory** | `backend` |
 | **Build Command** | `pip install -r requirements.txt` |
 | **Start Command** | `uvicorn main:app --host 0.0.0.0 --port $PORT` |
-| **Environment** | `GEMINI_API_KEY=your_key` |
+| **Environment** | `QWEN_API_KEY=your_key` |
 
 ### Frontend Service
 | Setting | Value |
@@ -115,7 +115,7 @@ SUPABASE_ANON_KEY=your_supabase_anon_key
 |-------|------------|
 | Frontend | Next.js 14, React, TypeScript, Tailwind CSS |
 | Backend | Python, FastAPI, WebSocket |
-| AI | Google Gemini 1.5 Flash |
+| AI | QWEN 3.5 Plus |
 | TTS | Edge TTS (Neerja Neural voice - Indian English) |
 | Face Detection | face-api.js with TinyFaceDetector |
 | Code Editor | Monaco Editor |
@@ -150,7 +150,7 @@ SUPABASE_ANON_KEY=your_supabase_anon_key
 
 ## � Interview Flow
 
-1. **Upload Resume** - Upload your PDF resume for AI analysis
+1. **Upload Resume** - Upload your PDF resume for AI analysis according to ATS standards
 2. **Configure Interview** - Select duration, type, difficulty, and persona
 3. **Read Instructions** - Review Do's & Don'ts before starting
 4. **Start Interview** - Camera, microphone, and full-screen mode activated
@@ -187,7 +187,7 @@ MIT License - feel free to use for your own projects!
 
 ## 🙏 Acknowledgments
 
-- Google Gemini for AI capabilities
+- Qwen for AI capabilities
 - Microsoft Edge TTS for voice synthesis
 - Monaco Editor for code editing
 - face-api.js for face detection
@@ -195,4 +195,5 @@ MIT License - feel free to use for your own projects!
 
 ---
 
-**Made with ❤️ for TechSprint**
+**Made with ❤️ by Om Gupta**
+**Thank You for Visiting 🙏, if you liked the project, then do star it also new features and suggestions are always welcome, you can create a pull request or fork the repo as well ♥️**
