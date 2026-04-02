@@ -35,5 +35,7 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     print("Warning: Supabase credentials not found in environment variables.")
 
-# Gemini Configuration
+# Ai Configuration
+QWEN_API_KEY = os.getenv("QWEN_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
