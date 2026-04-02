@@ -195,5 +195,6 @@ MIT License - feel free to use for your own projects!
 
 ---
 
-**Made with ❤️ by Om Gupta**
+**Made with ❤️ by Om Gupta.**
+
 **Thank You for Visiting 🙏, if you liked the project, then do star it also new features and suggestions are always welcome, you can create a pull request or fork the repo as well ♥️**
